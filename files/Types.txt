@@ -1,0 +1,179 @@
+This header defines three main things your solver needs everywhere:
+1) Conservative state (what you actually advance in time): U = [rho, rho*u, rho*v, rho*E].
+2) Primitive state (what is more physical to read/use for BCs): W = [rho, u, v, p, a].
+3) A Config struct that holds freestream/flow parameters, gas constant gamma, and some numerical parameters (CFL, JST coefficients, iteration counts), plus a small EOS namespace for gas-law helper functions.
+
+It is designed so that:
+- You can construct a Conservative either from raw components or from primitive variables.
+- You can convert back and forth (Primitive <-> Conservative).
+- You always clamp density and pressure to a small positive number to prevent NaNs.
+- You can generate a consistent freestream state from Config and use it to initialize the flow.
+
+2. Conservative state
+------------------------------------------------------------
+struct Conservative {
+    double rho;   // density
+    double rhou;  // x-momentum = rho * u
+    double rhov;  // y-momentum = rho * v
+    double rhoE;  // total energy = rho * (e + 0.5*u^2 + 0.5*v^2)
+    ...
+};
+
+This is the vector U that satisfies the Euler equations in conservative form. Each cell in the mesh will store one of these.
+
+Constructors:
+- default: sets everything to 0.0
+- parameterized: sets each component
+- from primitives: (rho, u, v, p, gamma)
+  - we compute velocity magnitude squared: V2 = u^2 + v^2
+  - internal energy per unit mass: e_int = p / ((gamma - 1) * rho)
+  - total energy per unit volume: rhoE = rho * ( e_int + 0.5*V2 )
+
+So building from primitives gives you a fully consistent conservative vector for a perfect gas.
+
+Accessors:
+- u() and v() return velocities by dividing momentum by density, with a small 1e-14 added to the denominator to avoid division by zero when rho ≈ 0.
+
+Operators:
+- operator+= and operator-= do component-wise addition/subtraction. These are used in Runge-Kutta or residual updates so you can write:
+      U[i] += dt * R[i];
+- free operators +, -, and scalar * are also provided:
+      U3 = U1 + U2;
+      U3 = U1 - U2;
+      U2 = 0.5 * U1;
+This makes time-integration code cleaner.
+
+3. Primitive state
+------------------------------------------------------------
+struct Primitive {
+    double rho, u, v, p, a;
+    ...
+};
+
+This is the more physically meaningful form:
+- rho: density
+- u, v: velocities
+- p: static pressure
+- a: speed of sound = sqrt(gamma * p / rho)
+
+Constructors:
+1) default: all zeros
+2) from (rho, u, v, p, gamma): sets fields and computes a
+3) from a Conservative and gamma:
+   - rho = max(U.rho, 1e-14) → clamp to avoid zero/negative
+   - u = U.rhou / rho
+   - v = U.rhov / rho
+   - kinetic energy per unit mass: ke = 0.5*(u^2 + v^2)
+   - p = max( (gamma - 1)*(U.rhoE - rho*ke), 1e-14 )
+     This is the usual Euler inversion: p = (gamma -1) * (E - 0.5*rho*V^2)
+     and then clamped.
+   - a = sqrt(gamma * p / rho)
+
+So any time you have a Conservative, you can safely get a Primitive without crashing on negative values: clamps protect you.
+
+Methods:
+- toConservative(gamma):
+  - converts back to U
+  - total energy per unit volume:
+      rhoE = p/(gamma - 1) + 0.5 * rho * (u^2 + v^2)
+- Mach():
+  - M = |V| / a, with a 1e-14 added to denominator to avoid zero-division
+
+4. EOS namespace
+------------------------------------------------------------
+namespace EOS {
+    inline double pressure(const Conservative& U, double gamma) { ... }
+    inline double soundSpeed(const Conservative& U, double gamma) { ... }
+    inline double totalEnthalpy(const Conservative& U, double gamma) { ... }
+    inline void makePhysical(Conservative& U, double gamma) { ... }
+}
+
+These are small helpers for a perfect gas.
+
+4.1 pressure(U, gamma)
+- rho = max(U.rho, 1e-14)
+- u = U.rhou / rho
+- v = U.rhov / rho
+- ke = 0.5 * rho * (u^2 + v^2)   // NOTE: this is kinetic energy per unit volume
+- p = (gamma - 1) * (U.rhoE - ke)
+- return max(p, 1e-14)
+So even if U.rhoE is slightly inconsistent, you won’t get negative p back.
+
+4.2 soundSpeed(U, gamma)
+- uses p = pressure(U,...)
+- a = sqrt(gamma * p / rho)
+
+4.3 totalEnthalpy(U, gamma)
+- h_t = (rhoE + p) / rho
+- standard definition for Euler.
+
+4.4 makePhysical(U, gamma)
+- Ensures U is a physically valid state
+- First, clamp density: U.rho = max(U.rho, 1e-14)
+- Compute p from U
+- If p < 1e-14 → recompute U.rhoE minimally so that p = 1e-14:
+    - recover u,v
+    - ke = 0.5 * rho * (u^2 + v^2)
+    - U.rhoE = (1e-14 / (gamma - 1)) + ke
+  So after makePhysical, rho>0 and p>0, which is useful after BC operations or limiters.
+
+5. Config struct
+------------------------------------------------------------
+struct Config {
+    double Mach_inf = 0.5;
+    double alpha_deg = 2.0;
+    double alpha_rad;
+    double gamma = 1.4;
+
+    double rho_inf = 1.0;
+    double p_inf = 1.0;
+    double a_inf;
+    double u_inf, v_inf;
+    double chord = 1.0;
+
+    double CFL = 0.1;
+    double k2_jst = 0.5;
+    double k4_jst = 0.2;
+    int maxIter = 1000;
+    int printFreq = 100;
+    int outputFreq = 500;
+
+    void initialize() { ... }
+    Primitive getFreestream() const { ... }
+};
+
+This gathers:
+- gas parameters: gamma
+- inflow/freestream parameters: Mach, angle of attack, rho_inf, p_inf
+- derived inflow values: a_inf, u_inf, v_inf
+- numerical parameters: CFL, JST k2/k4, iteration and output frequencies
+
+5.1 initialize()
+This must be called after you set Mach_inf, alpha_deg, rho_inf, p_inf, gamma.
+It does:
+- alpha_rad = alpha_deg * pi/180
+- a_inf = sqrt(gamma * p_inf / rho_inf)              // speed of sound from EOS
+- u_inf = Mach_inf * a_inf * cos(alpha_rad)
+- v_inf = Mach_inf * a_inf * sin(alpha_rad)
+
+So after initialize(), the Config knows the exact freestream velocity components corresponding to the chosen Mach and angle of attack.
+
+5.2 getFreestream()
+Returns a Primitive state built from:
+- rho = rho_inf
+- u = u_inf
+- v = v_inf
+- p = p_inf
+- gamma = config.gamma
+So you can do:
+    Config cfg;
+    cfg.initialize();
+    Primitive W_inf = cfg.getFreestream();
+    Conservative U_inf = W_inf.toConservative(cfg.gamma);
+and then fill the whole domain with U_inf.
+
+6. Notes on numerical intent
+- The small epsilons (1e-14) in divisions and clamps are there to keep the solver from producing NaNs when a cell gets temporarily unphysical (e.g. during early iterations or bad BCs).
+- The operators on Conservative make RK and residual code short and readable.
+- The separation Conservative/Primitive is standard for compressible flow codes: flux computations often need primitives, but storage/time-marching is in conservatives.
+- Config is deliberately small and plain: you can pass it by const reference everywhere (BCs, fluxes, time integrators) and they can all call cfg.gamma or cfg.getFreestream().

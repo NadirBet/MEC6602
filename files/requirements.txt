@@ -1,0 +1,229 @@
+# CFD Solver Requirements Specification
+
+## 1. Computation of mesh metrics
+
+### R1 – Cell area (2D "volume")
+The code must calculate the area of a 2D cell using the formula:
+
+volume = 0.5 * | a × b |
+
+(where "volume" in 2D is an area).
+
+### R2 – Face normal
+The normal vector of a face is obtained as the transpose (90° rotation) of the edge vector.
+
+The code must store the normalized normal vector (norm = 1).
+
+### R3 – Face area
+The code must also store the face surface (in 2D: the face length).
+
+### R4 – Consistent normal orientation
+The direction of normal vectors must be consistent across the entire mesh.
+
+For each face, the code must identify a "left" cell and a "right" cell relative to that face (topological sense).
+
+The face normal must be defined from "left" to "right".
+
+"Left" and "right" are to be understood topologically (according to mesh ordering), not geometrically.
+
+## 2. Structured Plot3D file format
+
+### R5 – Input format
+The input mesh is given in Plot3D format and must be read in this order:
+
+- An index indicating the number of blocks m
+- For each of the m blocks: a triplet of indices ni, nj (and k if in the file)
+- A list of coordinates in order:
+  - all x of block 1 (order i, j, k)
+  - all y of block 1 (order i, j, k)
+  - then same for block 2, etc.
+
+### R6 – Size
+The provided meshes range from 9×9 to 2049×2049.
+
+### R7 – Ghost layers
+After reading the Plot3D mesh, the code must add 2 layers of ghost cells for boundary condition implementation.
+
+## 3. Convective fluxes discretization
+
+### R8 – Scheme type
+The numerical scheme used for convective fluxes must be either upwinded or stabilized by adding numerical dissipation.
+
+### R9 – Flux calculation location
+To avoid truncation error problems, the convective flux must be calculated at the face and then added to the residual of the two adjacent cells.
+
+If the flux is calculated in a loop over cells, it will be counted twice.
+
+### R10 – Normal direction
+When adding the flux to the left cell and right cell, the direction of the stored normal vector (defined "left → right" according to previous slides) must be taken into account.
+
+What exits the left cell must enter the right cell.
+
+Therefore, for one of the two cells, the flux must be inverted.
+
+## 4. Centered fluxes discretization
+
+Consider the face between state 0 and state 1, with normal $\vec{n}_{01}$ and length $\Delta S_{01}$.
+
+### Method #1 (interior)
+$$(\vec{F}_c \Delta S)_{01} \approx \frac{1}{2}\left[ \vec{F}_c(\vec{W}_0, \vec{n}_{01}) + \vec{F}_c(\vec{W}_1, \vec{n}_{01}) \right] \Delta S_{01}$$
+
+### Method #2 (physical boundary)
+$$(\vec{F}_c \Delta S)_{01} \approx \vec{F}_c(\vec{W}_{01}, \vec{n}_{01}) \Delta S_{01}, \quad \vec{W}_{01} = \frac{1}{2}(\vec{W}_0 + \vec{W}_1)$$
+
+### R11 – Method choice
+The two methods are not equivalent.
+
+- Method #1 must be used for interior faces
+- Method #2 must be used for physical boundaries (and not for internal connectivities)
+
+## 5. Central scheme with scalar dissipation
+
+### R12 – Convective flux (central)
+On face $(i+\frac{1}{2}, j, k)$, the convective flux must be evaluated as:
+
+$$(\vec{F}_c \Delta S)_{i+1/2,j,k} \approx \vec{F}_c(\tilde{\vec{W}}_{i+1/2,j,k}, \vec{n}_{i+1/2,j,k}) \Delta S_{i+1/2,j,k}$$
+
+"See previous slide and replace by method 1" - the average of the two states on either side of the face must be done according to method 1 from the previous slide for interior faces.
+
+### R13 – Centered state
+The centered state used in the flux is:
+
+$$\tilde{\vec{W}}_{i+1/2,j,k} = \frac{1}{2}(\vec{W}_{i,j,k} + \vec{W}_{i+1,j,k})$$
+
+### R14 – Scalar artificial dissipation
+An artificial dissipation term is added on the same face:
+
+$$\tilde{D}_{i+1/2} = \hat{\Lambda}_{i+1/2}^S \left[\epsilon_{i+1/2}^{(2)}(\vec{W}_{i+1} - \vec{W}_i) - \epsilon_{i+1/2}^{(4)}(\vec{W}_{i+2} - 3\vec{W}_{i+1} + 3\vec{W}_i - \vec{W}_{i-1})\right]$$
+
+- The first bracket is the 2nd order term
+- The second is the 4th order term
+- The formula is written for the i direction and must also be applied in j
+
+## 6. Scaling of dissipation terms
+
+### R15 – Selective extinction
+- The 4th order term must be cut off in shocks
+- The 2nd order term must be cut off in smooth zones
+
+### R16 – Coefficients
+$$\epsilon_{i+1/2}^{(2)} = k^{(2)} \max(\Upsilon_i, \Upsilon_{i+1})$$
+
+$$\epsilon_{i+1/2}^{(4)} = \max[0, k^{(4)} - \epsilon_{i+1/2}^{(2)}]$$
+
+with
+
+$$\Upsilon_i = \frac{|p_{i+1} - 2p_i + p_{i-1}|}{p_{i+1} + 2p_i + p_{i-1}}$$
+
+and the given constants:
+- $k^{(2)} = 1/2$
+- $1/128 \leq k^{(4)} \leq 1/64$
+
+## 7. Scalar dissipation factor (spectral radius)
+
+### R17 – Dissipation multiplied by a scalar
+The dissipation is multiplied by a scalar value: the spectral radius $\hat{\Lambda}$.
+
+The spectral radius is the largest eigenvalue of the Jacobian (maximum information speed).
+
+### R18 – Formula for i-face and j-face
+$$\hat{\Lambda}_c^I = (|\vec{v} \cdot \vec{n}_I| + c) \Delta S_I$$
+
+$$\hat{\Lambda}_c^J = (|\vec{v} \cdot \vec{n}_J| + c) \Delta S_J$$
+
+where $\vec{v} \cdot \vec{n}$ is the contravariant velocity (scalar).
+
+### R19 – Value on the face
+$$\hat{\Lambda}_{i+1/2}^S = \frac{1}{2}(\hat{\Lambda}_c^I)_i + \frac{1}{2}(\hat{\Lambda}_c^J)_{i+1/2}$$
+
+(the slide shows the sum of I and J contributions on the face).
+
+## 8. Calculation of spectral radius at cell center
+
+### R20 – Basic data
+The surface normal and area are face data (already calculated in "computation of mesh metrics").
+
+### R21 – Average to center
+To obtain the spectral radius at the cell center, the values of the two faces bounding the cell in the I, J (and K if present) directions must be averaged.
+
+## 9. Boundary conditions
+
+### 9.1 No-Slip Wall Boundary Condition
+
+#### R22 – Ghost velocity (no-slip)
+For ghost cell 1 (the one just behind the wall), the velocity must be imposed by normal reflection:
+
+$$\vec{v}_1 = \vec{v}_2 - 2V_2 \hat{n}$$
+
+with
+
+$$V_2 = u_2 n_x + v_2 n_y + w_2 n_z$$
+
+i.e., remove twice the normal component of the velocity from the interior point.
+
+#### R23 – Pressure and density copied
+The pressure and density values of the ghost layers are simply copied from the interior cell (denoted "2" in the diagram):
+
+$$P_1 = P_2$$
+$$P_0 = P_2$$
+$$\rho_1 = \rho_2$$
+$$\rho_0 = \rho_2$$
+
+(indices 0 and 1 are the two layers on the wall side; 2 is the first interior cell)
+
+### 9.2 Farfield
+
+Four cases are distinguished, as shown on the slide.
+
+#### R24 – Supersonic inflow
+$$\vec{W}_b = \vec{W}_a$$
+
+→ the boundary state is directly the freestream state.
+
+#### R25 – Supersonic outflow
+$$\vec{W}_b = \vec{W}_d$$
+
+→ the boundary state is directly the interior state.
+
+#### R26 – Subsonic inflow
+Use the formulas given on the slide (mixture of interior state $(\rho_0, c_0)$ and freestream state "a") to reconstruct $\rho, u, v, w, p$ on the boundary.
+
+The text specifies:
+- $\rho_0$ and $c_0$ are taken from the interior point
+- "a" values come from the freestream
+
+#### R27 – Subsonic outflow
+Same principle as for subsonic inflow but with the formulas at the bottom of the slide (imposed pressure + extrapolation of velocity from the interior).
+
+#### R28 – Ghost cells filling
+"Values are then extrapolated from the interior and the BC to the ghost cell centers."
+
+→ after obtaining the state on the boundary, these values must be extended to the centers of ghost cells.
+
+## 10. Time integration
+
+### R29 – Basic scheme
+The time scheme used is explicit Euler:
+
+$$\Omega_i \frac{\partial \vec{W}_i}{\partial t} + \vec{R}_i = 0$$
+
+### R30 – Time discretization
+At iteration $n \to n+1$:
+
+$$\Omega_i \frac{\vec{W}_i^{n+1} - \vec{W}_i^n}{\Delta t_i} + \vec{R}_i^n = 0$$
+
+hence the increment:
+
+$$\Delta \vec{W}_i = \vec{W}_i^{n+1} - \vec{W}_i^n = -\frac{\vec{R}_i^n \Delta t_i}{\Omega_i}$$
+
+### R31 – Local time step
+The time step per cell is:
+
+$$\Delta t_i = \text{CFL} \frac{\Omega_i}{(\hat{\Lambda}_c^I + \hat{\Lambda}_c^J + \hat{\Lambda}_c^K)_i}$$
+
+### R32 – Spectral radii
+The spectral radii in each direction are those already defined:
+
+$$\hat{\Lambda}_c^I = (|\vec{v} \cdot \vec{n}_I| + c) \Delta S_I$$
+$$\hat{\Lambda}_c^J = (|\vec{v} \cdot \vec{n}_J| + c) \Delta S_J$$
+$$\hat{\Lambda}_c^K = (|\vec{v} \cdot \vec{n}_K| + c) \Delta S_K$$

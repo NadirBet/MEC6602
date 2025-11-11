@@ -1,0 +1,244 @@
+
+1. Purpose
+This header provides two solver-side utilities:
+
+A) BoundaryConditions:
+   - Takes the current solution U (cell-centered Conservative states) and the Mesh.
+   - Fills/updates ghost cells on all sides according to three BC types:
+     1. Slip wall at the bottom.
+     2. Freestream / Dirichlet farfield at the top.
+     3. Periodic (O-grid wrap) in the i-direction.
+   - Uses the Config to know the freestream state and gamma.
+
+B) AirfoilForces:
+   - Postprocessing tool to integrate pressure over an airfoil surface (one j-line) and return CL, CD, CM.
+
+------------------------------------------------------------
+2. BoundaryConditions class
+------------------------------------------------------------
+class BoundaryConditions {
+private:
+    const Config& cfg;
+    const Primitive U_inf;
+
+public:
+    BoundaryConditions(const Config& cfg_);
+    void apply(std::vector<Conservative>& U, const Mesh& mesh);
+    void initializeGhosts(std::vector<Conservative>& U, const Mesh& mesh);
+
+private:
+    void applyWallBC(...);
+    void applyFarfieldBC(...);
+    void applyPeriodicBC(...);
+};
+
+Key fields:
+- cfg: read-only reference to the global configuration (gamma, freestream parameters).
+- U_inf: primitive freestream, constructed once in the ctor and reused. This is faster and ensures consistency.
+
+Constructor:
+BoundaryConditions(const Config& cfg_)
+  : cfg(cfg_), U_inf(cfg_.getFreestream()) {}
+So right when you build this object, it knows the freestream primitive.
+
+------------------------------------------------------------
+2.1 apply(...)
+void apply(std::vector<Conservative>& U, const Mesh& mesh)
+
+This is the main entry point. It just chains the three BC handlers:
+- applyWallBC
+- applyFarfieldBC
+- applyPeriodicBC
+
+So a typical solver step does:
+   bc.apply(U, mesh);
+to refresh all ghost cells.
+
+------------------------------------------------------------
+2.2 initializeGhosts(...)
+void initializeGhosts(std::vector<Conservative>& U, const Mesh& mesh)
+
+This is the same as apply(...) but intended for the very beginning of the simulation, when the interior field has just been set to freestream. Calling it once guarantees ghost layers are initialized.
+
+------------------------------------------------------------
+3. Wall slip BC
+------------------------------------------------------------
+void applyWallBC(std::vector<Conservative>& U, const Mesh& mesh)
+
+Goal:
+- Bottom boundary (j = jmin) is an inviscid slip wall:
+  - No normal flow through the wall (normal velocity is reflected).
+  - Tangential velocity is kept.
+  - Density and pressure are copied from the adjacent interior cell.
+- All bottom ghost rows get the same reflected state.
+
+Steps:
+
+1) Get interior bounds:
+   mesh.getInteriorBounds(imin, imax, jmin, jmax);
+
+2) Loop over interior i:
+   for (int i = imin; i < imax; ++i) {
+     int idx_int = mesh.cellIndex(i, jmin);
+     Primitive W_int(U[idx_int], cfg.gamma);
+   }
+
+3) Get the wall face normal from the mesh:
+   std::array<double,2> normal = mesh.faceNormal_i_out[idx_int];
+   - We deliberately use the OUT version, because the mesh has already oriented i-faces to point outward (radially) from the airfoil.
+   - If we used the raw geometric normal, it might point inward in some places.
+
+4) Normalize the normal:
+   mag = sqrt(nx^2 + ny^2)
+   nx = normal[0] / (mag + 1e-14)
+   ny = normal[1] / (mag + 1e-14)
+
+5) Compute the interior normal velocity:
+   vn = W_int.u * nx + W_int.v * ny
+
+6) Reflect:
+   W_ghost = W_int
+   W_ghost.u = W_int.u - 2 * vn * nx
+   W_ghost.v = W_int.v - 2 * vn * ny
+
+   This is the standard slip-wall reflection: the component along the wall is unchanged, the component normal to the wall is reversed.
+
+7) Convert to conservative:
+   Conservative U_ghost = W_ghost.toConservative(cfg.gamma);
+
+8) Write to ALL ghost layers below the wall:
+   for (int g = 1; g <= NGHOST; ++g) {
+       int idx_ghost = mesh.cellIndex(i, jmin - g);
+       U[idx_ghost] = U_ghost;
+   }
+
+So if NGHOST = 2, both jmin-1 and jmin-2 get the same reflected state.
+
+------------------------------------------------------------
+4. Farfield BC (Dirichlet)
+------------------------------------------------------------
+void applyFarfieldBC(std::vector<Conservative>& U, const Mesh& mesh)
+
+Goal:
+- Enforce freestream values in the top ghost rows (j ≥ jmax).
+- This is a simplified, robust BC suitable for early development: it guarantees uniform flow stays uniform and avoids instabilities from half-baked characteristic BCs.
+
+Steps:
+1) Get interior bounds: imin, imax, jmin, jmax.
+2) Build conservative freestream once:
+   Conservative U_far = U_inf.toConservative(cfg.gamma);
+3) For each interior i:
+   for (int g = 0; g < NGHOST; ++g) {
+       int j_ghost = jmax + g;
+       int idx_ghost = mesh.cellIndex(i, j_ghost);
+       U[idx_ghost] = U_far;
+   }
+
+So every ghost row above the interior top edge becomes exactly freestream.
+
+------------------------------------------------------------
+5. Periodic BC (i-direction)
+------------------------------------------------------------
+void applyPeriodicBC(std::vector<Conservative>& U, const Mesh& mesh)
+
+Goal:
+- Because this is an O-grid, the domain should wrap around in i.
+- That means the solution at the left ghost columns must match the right interior columns, and vice versa.
+
+Steps:
+1) Get interior bounds.
+2) For every j from 0 to mesh.njTotal - 1:
+   (We do it for all rows, including ghost rows, to keep them consistent.)
+
+   a) Left ghosts:
+      for (int g = 1; g <= NGHOST; ++g) {
+          i_ghost = imin - g;
+          i_donor = imax - g;
+          U[i_ghost,j] = U[i_donor,j];
+      }
+      This copies the last NGHOST interior columns on the right into the left NGHOST ghost columns.
+
+   b) Right ghosts:
+      for (int g = 0; g < NGHOST; ++g) {
+          i_ghost = imax + g;
+          i_donor = imin + g;
+          U[i_ghost,j] = U[i_donor,j];
+      }
+      This copies the first NGHOST interior columns on the left into the right NGHOST ghost columns.
+
+Result:
+- State field now wraps in i the same way the mesh geometry wrapped.
+
+------------------------------------------------------------
+6. AirfoilForces class
+------------------------------------------------------------
+This class is independent of boundary application but uses the same mesh/Config to compute aerodynamic coefficients.
+
+class AirfoilForces {
+private:
+    const Config& cfg;
+    double x_ref, y_ref;
+public:
+    struct Coefficients { double CL, CD, CM; };
+    AirfoilForces(const Config& cfg_);
+    Coefficients compute(...);
+private:
+    void findQuarterChord(...);
+};
+
+6.1 findQuarterChord(mesh, jAirfoil)
+- We scan all i on the specified airfoil j-line.
+- Track x_min and x_max.
+- Quarter-chord x is: x_ref = x_min + 0.25*(x_max - x_min)
+- y_ref = 0
+This gives us a reference point for moments (roughly the usual aerodynamic quarter-chord).
+
+6.2 compute(...)
+Inputs:
+- U: current solution (to get pressure).
+- mesh: to get geometry (face normals, lengths, coordinates).
+- jAirfoil: index of the wall/airfoil surface.
+
+Procedure:
+1) Call findQuarterChord to set x_ref, y_ref.
+2) Prepare accumulators: Fx=0, Fy=0, M_ref=0.
+3) Get interior bounds: imin..imax.
+4) Compute dynamic pressure and reference area:
+   q_inf = 0.5 * cfg.rho_inf * (cfg.Mach_inf * cfg.a_inf)^2
+   S_ref = cfg.chord
+5) For each i in [imin, imax):
+   - idx_wall = mesh.cellIndex(i, jAirfoil)
+   - p_wall = EOS::pressure(U[idx_wall], cfg.gamma)
+   - normal = mesh.faceNormal_i_out[idx_wall]
+     (again using oriented normal consistent with wall BC)
+   - ds = mesh.faceLen_i[idx_wall]
+   - normalize normal → (nx, ny)
+   - differential forces:
+       dFx = p_wall * nx * ds
+       dFy = p_wall * ny * ds
+     Add to totals.
+   - moment arm from ref point:
+       x_cp = mesh.x(i, jAirfoil)
+       y_cp = mesh.y(i, jAirfoil)
+       dx = x_cp - x_ref
+       dy = y_cp - y_ref
+       M_ref += dx * dFy - dy * dFx
+
+6.3 Rotate to lift/drag axes
+- Freestream angle = cfg.alpha_rad
+- Lift = -Fx*sin(alpha) + Fy*cos(alpha)
+- Drag =  Fx*cos(alpha) + Fy*sin(alpha)
+
+6.4 Non-dimensionalize
+CL = Lift / (q_inf * S_ref)
+CD = Drag / (q_inf * S_ref)
+CM = M_ref / (q_inf * S_ref * cfg.chord)
+
+Return Coefficients{CL, CD, CM}.
+
+------------------------------------------------------------
+7. Consistency notes
+------------------------------------------------------------
+- Wall BC and force integration both use mesh.faceNormal_i_out on the airfoil j-line. This is deliberate: one orientation convention is applied in Mesh, and everybody else just uses it.
+- Farfield is pure Dirichlet to avoid unphysical states in ghost cells.
+- Periodic uses the same indices and number of ghost layers as the mesh geometry copying, so state and geometry stay aligned.

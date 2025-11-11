@@ -1,0 +1,50 @@
+content = """Recap des divergences par rapport au cahier des charges
+
+1. Lecture du maillage
+- Le requirement prévoit la lecture de plusieurs blocs Plot3D (m blocs).
+- L’implémentation actuelle ne lit qu’un seul bloc.
+- Donc c’est conforme tant que tu n’utilises qu’un bloc, mais ce n’est pas conforme textuellement au requirement.
+
+2. Stockage des normales
+- Le requirement dit que la normale de face doit être stockée normalisée (norme = 1).
+- L’implémentation stocke la normale géométrique et la longueur de la face, puis renormalise au moment de l’usage.
+- Numériquement ça revient au même, mais le format ne correspond pas exactement à ce qui est demandé.
+
+3. Orientation des normales
+- Le requirement veut une orientation topologique « left → right » uniforme pour toutes les faces.
+- L’implémentation oriente surtout les faces dans le sens « vers l’extérieur » adapté à un O-grid (surtout pour les i-faces), et les j-faces ne sont pas toutes remises dans ce standard.
+- Ça marche pour le cas O-grid prévu, mais ce n’est pas la règle générale décrite dans le requirement.
+
+4. Condition aux limites farfield
+- Le requirement décrit les quatre cas classiques (supersonic inflow, supersonic outflow, subsonic inflow, subsonic outflow) avec mélange ou pression imposée.
+- L’implémentation applique simplement le freestream (Dirichlet) dans les lignes fantômes du haut.
+- C’est suffisant pour le développement, mais ce n’est pas conforme aux quatre cas du requirement.
+
+5. JST : capteur de pression et coefficients variables
+- Le requirement veut que les coefficients de dissipation (ordre 2 et ordre 4) soient modulés par un capteur de pression pour couper le 4e ordre dans les chocs et limiter le 2e ordre dans les zones lisses.
+- L’implémentation utilise des k2 et k4 constants passés au constructeur.
+- La structure JST est bonne, mais il manque la partie « capteur » décrite dans le requirement.
+
+6. JST : combinaison des rayons spectraux
+- Le requirement mentionne une combinaison des contributions I et J pour le rayon spectral.
+- L’implémentation prend simplement le rayon spectral local de la face courante.
+- C’est un schéma JST valide, mais plus simple que ce que demande le requirement.
+
+7. Dépendance à la convention de normales du mesh
+- Les BC de mur et le post-traitement de forces utilisent la normale orientée que fournit le mesh.
+- Le requirement de maillage décrit une convention plus générale.
+- Le code est cohérent en interne, mais suppose que le mesh est déjà orienté comme lui.
+
+8. BC périodique i-direction
+- L’implémentation ajoute une condition périodique en i (logique pour un O-grid).
+- Le requirement ne la décrit pas.
+- Ce n’est pas une erreur, mais c’est hors du scope explicite du requirement.
+
+9. Détail de boucle
+- Dans la description de la boucle sur les i-faces, la condition doit être « j <= jmax » pour traiter le farfield.
+- Sinon le top ne serait pas traité.
+
+10. Vérification métrique
+- Le requirement veut que les normales soient stockées normalisées et orientées.
+- L’implémentation recompense n·ds et fait un test de fermeture de métrique pour vérifier la cohérence.
+- Ça assure la cohérence en pratique, mais montre que le stockage de base n’est pas exactement celui attendu.

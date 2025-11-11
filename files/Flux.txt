@@ -1,0 +1,293 @@
+
+1. Purpose
+This class computes the Euler residuals (finite-volume form) on a structured O-grid using
+- central (symmetric) convective fluxes,
+- Jameson–Schmidt–Turkel (JST) artificial dissipation (2nd + 4th order),
+- special handling for the bottom wall and top farfield,
+- i-periodicity for the O-grid,
+and it does it in the same face-ownership pattern as the Mesh (each cell owns its bottom i-face and its left j-face).
+
+It also contains extra diagnostic routines to check metric consistency and to debug a single face flux.
+
+------------------------------------------------------------
+2. Data it needs
+- U stdvectorConservative         → current solution at cell centers
+- R stdvectorConservative (output)→ residual dUdt = - (sum of fluxes)Area (area division happens elsewhere)
+- mesh Mesh                            → provides geometry (normals, lengths, interior bounds)
+- cfg Config                           → provides gamma (EOS) and flow params
+
+The class itself stores only k2 and k4, which are the JST dissipation coefficients.
+
+------------------------------------------------------------
+3. Constructor
+FluxCalculator(double k2_ = 0.5, double k4_ = 0.02)
+- k2 2nd-order (Laplace-like) dissipation coefficient
+- k4 4th-order (biharmonic-like) dissipation coefficient
+These are passed into the JST routine later.
+
+------------------------------------------------------------
+4. computeResidual(...)
+This is the main routine called by the time integrator.
+
+Signature
+void computeResidual(
+    const stdvectorConservative& U,
+    stdvectorConservative& R,
+    const Mesh& mesh,
+    const Config& cfg
+)
+
+Steps
+
+4.1 Zero the residual
+for (auto& r  R) r = {0,0,0,0};
+
+We build the residual from scratch every call.
+
+4.2 Get interior bounds
+mesh.getInteriorBounds(imin, imax, jmin, jmax);
+As usual
+- interior i [imin, imax)
+- interior j [jmin, jmax)
+
+4.3 I-FACE loop (vertical faces in logical space)
+for (int j = jmin; j = jmax; ++j)
+  for (int i = imin; i  imax; ++i)
+
+Note j goes all the way to jmax (inclusive) because we need to handle 3 cases
+- j == jmin → wall interface
+- jmin  j  jmax → interior interface
+- j == jmax → farfield interface
+
+Case A j == jmin (wall)
+- We are at the interface between ghost row (jmin-1) and interior row (jmin).
+- The geometry for that face is “bottom i-face of interior cell (i, jmin)”.
+- We call computeWallFlux(...) to build a physical wall flux from the interior+ghost states.
+- Then we ADD that flux to the interior cell residual
+    R[idx_int] += F;
+  (Because the flux is defined as going into the interior cell.)
+
+Case B jmin  j  jmax (true interior face)
+- Face is between lower cell (i, j-1) and upper cell (i, j).
+- Geometry is taken from the bottom i-face of the UPPER cell → faceIdx = mesh.cellIndex(i, j).
+- We call computeInteriorFlux(UL, UR, normal, ds, ...)
+- Then we do conservative assembly
+    R[lower] -= F;
+    R[upper] += F;
+  This is the standard FV pattern what leaves the lower cell enters the upper.
+
+Case C j == jmax (top  farfield)
+- Interface between interior cell (i, jmax-1) and farfield ghost (i, jmax).
+- We take the face geometry from the ghost cell (i, jmax) bottom i-face.
+- We build a simple averaged boundary state Wb = 0.5(Wi + Wg), turn it into a flux (like central).
+- We apply it as “flux leaving the interior cell”
+    R[idInt] -= F;
+  because the farfield is outside.
+
+So the I-face loop correctly handles bottom, interior vertical faces, and top.
+
+4.4 J-FACE loop (horizontal faces in logical space)
+for (int j = jmin; j  jmax; ++j)
+  for (int i = imin + 1; i  imax; ++i)
+    ...
+   periodic closure
+
+This loop does “left-right” internal faces plus the periodic connection.
+
+- Interior horizontal face is between (i-1, j) [left] and (i, j) [right].
+- Geometry left j-face of the right cell → faceIdx = mesh.cellIndex(i, j)
+- We call computeInteriorFlux(...) with alongI = false.
+- NOTE sign pattern here is intentionally FLIPPED relative to the i-faces
+
+    R[left]  += F;
+    R[right] -= F;
+
+This is consistent with how the solver chose to orient the j-face normal it is pointing roughly to the right, so flux is added to the left cell and subtracted from the right cell.
+
+- After the regular horizontal faces, they do a “periodic closure”
+  - between (imax-1, j) and (imin, j)
+  - same computeInteriorFlux, same flipped assembly.
+
+So after both face loops, R holds the sum of all fluxes for every interior cell.
+
+------------------------------------------------------------
+5. computeWallFlux(...)
+Signature
+Conservative computeWallFlux(
+    const stdvectorConservative& U,
+    int i, int jWall,
+    const Mesh& mesh,
+    const Config& cfg
+) const
+
+This is the wall-face version of the central flux.
+
+Steps
+1) interior cell = (i, jWall)
+   ghost cell    = (i, jWall-1)
+2) Convert both to Primitive Wi, Wg
+3) Simple average at the wall
+   Wb = 0.5(Wi + Wg) componentwise
+4) Turn Wb into conservative Ub
+5) Get wall face geometry from mesh
+   - faceIdx = (i, jWall)
+   - normal = mesh.faceNormal_i_out[faceIdx]
+   - ds     = mesh.faceLen_i[faceIdx]
+   Using _out makes the wall flux sign consistent.
+6) Normalize normal and project velocity
+   un = Wb.unx + Wb.vny
+7) Total enthalpy H = EOStotalEnthalpy(Ub, gamma)
+8) Build Euler flux
+   F.rho  =  rho  un  ds
+   F.rhou = (rhouun + pnx)  ds
+   F.rhov = (rhovun + pny)  ds
+   F.rhoE = (rhoHun)  ds
+Return F.
+
+This is a “method #2” style wall flux average interior+ghost primitive, then evaluate flux with wall normal.
+
+------------------------------------------------------------
+6. computeInteriorFlux(...)
+Signature
+Conservative computeInteriorFlux(
+    const Conservative& UL,
+    const Conservative& UR,
+    const stdarraydouble,2& normal,
+    double ds,
+    const Config& cfg,
+    bool alongI,
+    int i, int j,
+    const stdvectorConservative& U,
+    const Mesh& mesh
+) const
+
+This is the central JST flux used for both i-faces and j-faces.
+
+Steps
+1) Normalize normal → (nx, ny)
+2) Convert UL, UR → WL, WR
+3) Compute normal velocities
+   unL = uLnx + vLny
+   unR = uRnx + vRny
+4) Compute total enthalpies HL, HR with EOS.
+5) Build central (symmetric) flux
+   F = 0.5  [ F(UL) + F(UR) ]
+   but written out explicitly
+   F.rho  = 0.5(rhoLunL + rhoRunR)  ds
+   F.rhou = 0.5(rhoLuLunL + pLnx + rhoRuRunR + pRnx)  ds
+   F.rhov = 0.5(rhoLvLunL + pLny + rhoRvRunR + pRny)  ds
+   F.rhoE = 0.5(rhoLHLunL + rhoRHRunR)  ds
+
+6) Call addJSTDissipation(...) to add artificial viscosity terms to F. This is where k2k4, lambda, and neighbor values come in.
+
+7) Return F.
+
+Note The extra parameters (alongI, i, j, U, mesh) are passed down to the JST routine so it can look up neighbors in the correct direction and apply 4th-order dissipation only when there are enough neighbors.
+
+------------------------------------------------------------
+7. addJSTDissipation(...)
+Signature
+void addJSTDissipation(
+    Conservative& F,
+    const Conservative& UL,
+    const Conservative& UR,
+    const Primitive& WL,
+    const Primitive& WR,
+    double nx, double ny, double ds,
+    bool alongI, int i, int j,
+    const stdvectorConservative& U,
+    const Mesh& mesh,
+    const Config& cfg
+) const
+
+This function modifies F in-place.
+
+Steps
+
+7.1 Compute local spectral radius on the face
+   unL = WL.unx + WL.vny
+   unR = WR.unx + WR.vny
+   lambda = max( unL + aL, unR + aR )
+This is the usual central-JST wave speed estimate.
+
+7.2 2nd-order dissipation (if k2 != 0)
+   D2 = k2  lambda  (UR - UL)  ds
+   F -= D2
+This damps odd-even decoupling but is too dissipative alone.
+
+7.3 4th-order dissipation
+We only add 4th order if we can get the 2 neighbors needed to form the 4-point stencil
+
+- If alongI = true (we are on an i-face), the “line” is in j
+  you need j-2, j-1, j, j+1 for the same i to do
+    (U_{j+1} - 3U_j + 3U_{j-1} - U_{j-2})
+  So the code checks j  jmin+1 && j  jmax-1.
+
+- If alongI = false (we are on a j-face), the “line” is in i, and we must respect periodicity. The code explicitly wraps the indices to get i-2 and i+1 correctly.
+
+Once we have ULm1 and URp1, we build
+  D4 = k4  lambda  (URp1 - 3UR + 3UL - ULm1)  ds
+and ADD it to F (note 4th-order is added, 2nd-order is subtracted).
+
+So final flux is
+  F = F_central - D2 + D4
+
+This is the standard JST pattern.
+
+------------------------------------------------------------
+8. debugInteriorFaceFlux(...)
+This is a helper for you while debugging. You pass an i,j and whether it’s an i-face or j-face, and it
+
+- clamps i,j to a valid interior face,
+- finds leftright (or lowerupper) cell IDs,
+- calls the real computeInteriorFlux,
+- builds the residual contributions (-F, +F),
+- prints everything
+  - face normal, ds
+  - UL, UR
+  - flux
+  - the residuals that would be added to each cell
+  - the sum of both residuals (should be ~0)
+
+This lets you verify that sign conventions and metric usage are correct.
+
+------------------------------------------------------------
+9. computeMetricResidual(...)
+This is a geometry-only check, not a physical flux.
+
+It rebuilds, per interior cell, the sum of its 4 bounding face vectors (n  ds) using EXACTLY the same ownership pattern as the mesh
+- bottom i-face this cell
+- top i-face cell above
+- left j-face this cell
+- right j-face cell to the right
+
+Then it stores
+  R[c].rhou = sum of x-components
+  R[c].rhov = sum of y-components
+
+For a perfectly consistent grid, these should be ~0. This is a discrete geometric conservation check.
+
+------------------------------------------------------------
+10. computeMetricResidualFluxAssembly(...)
+This is the same idea as computeMetricResidual, but it uses THE SAME face loops and sign conventions as computeResidual (the physical one). The only difference is that instead of physical Euler flux, it injects
+  F = (0, n_xds, n_yds, 0)
+into the residual assembly. If geometry + assembly are consistent, the residuals should vanish in the interior.
+
+This is a very good test to detect mismatched face ownership, wrong sign, or bad periodic copying.
+
+------------------------------------------------------------
+11. Summary of sign conventions
+- I-faces (vertical in logical space)
+  interior face between (i,j-1) and (i,j)
+    R[i,j-1] -= F
+    R[i,j]   += F
+  bottom wall R[interior] += F
+  top farfield R[interior] -= F
+
+- J-faces (horizontal in logical space)
+  interior face between (i-1,j) and (i,j)
+    R[i-1,j] += F
+    R[i,j]   -= F
+  periodic closure does the same.
+
+These choices match the way Mesh computed its face normals.

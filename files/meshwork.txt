@@ -1,0 +1,300 @@
+
+1. Purpose
+The Mesh class builds and stores all geometry needed by a 2D finite-volume Euler solver on a single-block O-grid with ghost cells. It is responsible for:
+- holding node coordinates (with ghosts),
+- deriving cell centers,
+- computing cell areas,
+- computing face normals and lengths,
+- fixing normal orientations for an O-grid,
+- propagating geometry into ghost cells and periodic boundaries,
+- computing averaged face metrics,
+- computing directional spectral radii for local time-stepping.
+
+2. Core constants and dimensions
+- NGHOST = 2: there are two ghost layers on every side in i and j.
+- Interior cells: ni × nj (what the solver “really” advances).
+- Total cells: niTotal = ni + 2*NGHOST, njTotal = nj + 2*NGHOST.
+- Total nodes: niNodes = niTotal + 1, njNodes = njTotal + 1 (because a cell grid of M×N needs (M+1)×(N+1) nodes).
+
+3. Storage layout
+- Nodes:
+  - xNodes, yNodes: size = niNodes * njNodes
+  - Access: nodeIndex(i,j) = j*niNodes + i
+  - These are point coordinates of the structured grid, including ghost nodes.
+
+- Cells:
+  - xCells, yCells: size = niTotal * njTotal
+  - Access: cellIndex(i,j) = j*niTotal + i
+  - These are cell-centered coordinates, computed from the surrounding 4 corner nodes.
+
+- Areas:
+  - cellArea: one per cell, same layout as xCells/yCells.
+
+- Face geometry per cell:
+  Each cell (i,j) stores the geometry of:
+  - its bottom (south) face in the i-direction: faceNormal_i[idx], faceLen_i[idx]
+  - its left (west) face in the j-direction: faceNormal_j[idx], faceLen_j[idx]
+  This is a common structured-FV convention: the cell owns its south and west faces.
+
+  “Geometric” normals are the ones computed directly from node coordinates.
+  “Oriented” normals (…_out) are versions that may be flipped later to match an outward convention.
+
+- Averaged metrics:
+  - faceNormal_i_avg, faceLen_i_avg
+  - faceNormal_j_avg, faceLen_j_avg
+  These are built later to represent the metric centered between two neighboring cells and are used for wave-speed/spectral-radius work.
+
+- Spectral radii:
+  - lambda_i, lambda_j: per-cell directional wave speeds used in local time stepping.
+
+4. Constructors
+Mesh() = default: empty.
+Mesh(int ni_, int nj_):
+- stores interior counts ni, nj
+- computes totals with ghosts
+- allocates all vectors to the correct sizes, but does NOT assign actual coordinates. After this, you must initialize coordinates (either from a file or with initCartesianTest) and then build geometry.
+
+5. Index helpers
+- nodeIndex(i,j): row-major, nodes
+- cellIndex(i,j): row-major, cells
+These guarantee a consistent layout across all arrays.
+
+6. initCartesianTest(x0,x1,y0,y1)
+Goal: create a simple uniform Cartesian grid INCLUDING ghosts.
+Steps:
+1. Compute physical spacings from the interior counts:
+   dx = (x1 - x0) / ni
+   dy = (y1 - y0) / nj
+2. Loop over all nodes, including ghost rings. For node (i,j):
+   - its “physical” index is (i - NGHOST, j - NGHOST)
+   - node x = x0 + (i - NGHOST)*dx
+   - node y = y0 + (j - NGHOST)*dy
+   So ghost nodes are just uniform extensions.
+3. After filling nodes, call computeCellCenters() to get cell-centered x,y by averaging the 4 corner nodes.
+
+After this function: every node and every cell center is defined, but face normals, areas, and spectral radii are not yet built. That is done by buildGeometry() later.
+
+7. readPlot3D(filename)
+Goal: read a 1-block structured Plot3D file (ASCII) and insert it into this ghosted mesh.
+Steps:
+1. Read number of blocks; must be 1.
+2. Read ni_nodes, nj_nodes from file. These are physical nodes, without ghosts.
+3. Rebuild the Mesh to have (ni_nodes - 1) × (nj_nodes - 1) interior cells:
+   *this = Mesh(ni_nodes - 1, nj_nodes - 1);
+   This allocates everything with ghosts.
+4. Read x coordinates from the file for all physical nodes. Each read node is placed at (i+NGHOST, j+NGHOST) in our own node arrays. This means physical nodes are shifted by NGHOST to leave room for ghost nodes.
+5. Read y coordinates similarly.
+6. Close file.
+7. Call fillGhostNodes() to populate the ghost node coordinates (bottom mirror, top linear, i-periodic).
+8. Call computeCellCenters() to compute cell-centered coordinates from the final node field.
+
+After readPlot3D, we have a complete node field (physical from file, ghosts extrapolated) and cell centers.
+
+8. getInteriorBounds(...)
+This just returns:
+- imin = NGHOST
+- imax = NGHOST + ni
+- jmin = NGHOST
+- jmax = NGHOST + nj
+Loops over interior cells always use i in [imin, imax) and j in [jmin, jmax).
+
+9. fillGhostNodes()
+This operates on NODES (xNodes, yNodes), not cells.
+There are 3 parts:
+
+a) Bottom boundary (wall-like): mirror in y
+For each i and for g=0..NGHOST-1:
+- j_ghost = jmin - 1 - g
+- j_wall  = jmin
+- j_mirror = jmin + 1 + g
+We copy:
+  xNodes[j_ghost] = xNodes[j_wall]       (vertical mirror keeps x)
+  yNodes[j_ghost] = 2*yNodes[j_wall] - yNodes[j_mirror]
+So y is reflected across the wall.
+
+b) Top boundary (farfield): linear extrapolation
+For each i and g=0..NGHOST-1:
+- j_ghost = jmax + 1 + g
+- j1 = jmax - g
+- j2 = jmax - 1 - g
+We set:
+  x_g = 2*x_j1 - x_j2
+  y_g = 2*y_j1 - y_j2
+So the mesh is smoothly extended upward.
+
+c) i-periodic (O-grid)
+For each j:
+- left ghost columns copy from right interior columns
+- right ghost columns copy from left interior columns
+This is done for NGHOST columns on both sides.
+
+After fillGhostNodes, every node in the full padded domain has valid coordinates.
+
+10. computeCellCenters()
+For every cell (i,j) including ghosts:
+- take its 4 corner nodes:
+  n00 = (i, j)     // SW
+  n10 = (i+1, j)   // SE
+  n01 = (i, j+1)   // NW
+  n11 = (i+1, j+1) // NE
+- center = simple average of the 4 corners
+Store into xCells[cellIndex(i,j)] and yCells[cellIndex(i,j)].
+
+11. buildGeometry(U, cfg)
+This is the high-level pipeline the solver should call once coordinates and an initial flow field U exist.
+It does, in order:
+1) computeCellAreasAndFaces();
+2) correctNormalOrientations();
+3) fillGhostGeometry();
+4) applyPeriodicBoundaries();
+5) computeAveragedQuantities();
+6) computeSpectralRadii(U, cfg);
+
+After buildGeometry, every cell (including ghosts) has:
+- a valid area,
+- valid geometric normals,
+- valid oriented normals,
+- valid lengths,
+- periodic copies in i,
+- averaged metrics for interior cells,
+- spectral radii for interior cells.
+
+12. computeCellAreasAndFaces()
+This is the fundamental geometric pass. For every cell (including ghosts):
+- Read its 4 corner nodes: SW (n00), SE (n10), NW (n01), NE (n11).
+- Compute its area with the 4-point shoelace formula:
+  A = 0.5 * | x00*(y10 - y01) + x10*(y11 - y00) + x11*(y01 - y10) + x01*(y00 - y11) |
+  This handles general quad shapes better than a naive dx*dy.
+
+- Compute the bottom (i) face:
+  Edge is n00 -> n10
+  tangent = (dx_i, dy_i) = (x10 - x00, y10 - y00)
+  geometric normal = (dy_i, -dx_i)  // 90° CCW rotation
+  length = sqrt(dx_i^2 + dy_i^2)
+  Store in faceNormal_i[idx], faceLen_i[idx].
+
+- Compute the left (j) face:
+  Edge is n00 -> n01
+  tangent = (x01 - x00, y01 - y00)
+  geometric normal = (dy_j, -dx_j)
+  length = sqrt(dx_j^2 + dy_j^2)
+  Store in faceNormal_j[idx], faceLen_j[idx].
+
+- Initialize oriented normals to equal geometric normals:
+  faceNormal_i_out[idx] = faceNormal_i[idx]
+  faceNormal_j_out[idx] = faceNormal_j[idx]
+
+So after this routine, all cells (even ghosts) have raw geometric metrics built directly from nodes.
+
+13. correctNormalOrientations()
+This step is specific to the O-grid and is meant to make i-direction normals point “radially outward” from the body.
+
+Steps:
+a) Determine an approximate center (xc0, yc0):
+   - Take all interior cells on the lowest interior row j=jmin
+   - Average their cell centers
+   - This row is assumed to be near the body/wall → averaging gives a reasonable center.
+
+b) For each interior cell (i,j):
+   - make the radial vector r = (xCell - xc0, yCell - yc0)
+   - take the geometric i-normal (nx, ny) = faceNormal_i[idx]
+   - compute dot = n · r
+   - if dot < 0, flip the normal:
+       nx = -nx; ny = -ny;
+   - store into faceNormal_i_out[idx]
+So all i-direction oriented normals now point away from the center.
+
+c) For j-faces you don’t change the sign; you just copy the geometric normal into oriented:
+   faceNormal_j_out[idx] = faceNormal_j[idx]
+This is because the j-direction on an O-grid is typically the circumferential direction where sign is less of an issue.
+
+14. fillGhostGeometry()
+Now we must make sure that ghost CELLS (not nodes) have valid geometry.
+
+We already computed geometry for every cell, but for ghost rows we want them to match the closest physical row, not whatever the raw computation gave.
+
+- Bottom ghosts:
+  For i in interior range:
+    let idx_i = cellIndex(i, jmin)  // interior first row
+    for g = 1..NGHOST:
+       idx_g = cellIndex(i, jmin - g)
+       copy area, face normals i/j, lengths i/j
+       copy oriented normals
+  → bottom ghost rows become perfect copies of the first interior row.
+
+- Top ghosts:
+  For i in interior range:
+    let idx_ref = cellIndex(i, jmax)  // first ghost row above interior
+    for g = 1..NGHOST-1:
+       idx_g = cellIndex(i, jmax + g)
+       copy geometry from idx_ref
+  → all ghost rows above the first ghost row are made identical to that first ghost row. The first ghost row itself was already computed from extrapolated nodes, so we keep that.
+
+This guarantees that the top and bottom ghost cells have sensible, stable geometry, matching the BC intent.
+
+15. applyPeriodicBoundaries()
+This mirrors the earlier node-periodic logic, but now for CELLS and their geometry.
+
+For every j (all j = 0..njTotal-1):
+- Left ghost columns:
+  for g = 1..NGHOST:
+    i_ghost = imin - g
+    i_donor = imax - g
+    copy: cellArea, faceNormal_i, faceNormal_j, faceLen_i, faceLen_j, faceNormal_i_out, faceNormal_j_out
+
+- Right ghost columns:
+  for g = 0..NGHOST-1:
+    i_ghost = imax + g
+    i_donor = imin + g
+    copy same fields
+
+So after this, all ghost columns in i-direction have geometry consistent with the corresponding periodic donor columns. This is necessary for an O-grid that wraps around.
+
+16. computeAveragedQuantities()
+This builds the “avg” versions of face metrics for interior cells only.
+
+For each interior cell (i,j):
+
+- i-direction:
+  If i is strictly inside (i>imin && i<imax-1), you have a left neighbor and you do:
+    len_avg = 0.5*(faceLen_i[idx] + faceLen_i[idx_left])
+    n_avg   = 0.5*(faceNormal_i[idx] + faceNormal_i[idx_left])
+  Else (rightmost or leftmost interior column):
+    just copy the cell’s own i-face data.
+
+- j-direction: same logic with the cell below.
+
+This produces a per-cell representation of the face between two cells, good enough to feed wave-speed calculations.
+
+17. computeSpectralRadii(U, cfg)
+This is the last step: it uses geometry + current flow field to compute directional spectral radii.
+
+For each interior cell:
+- Convert U[idx] → primitive W (so you get u, v, a) using cfg.gamma.
+- i-direction:
+  - take averaged normal n_i = faceNormal_i_avg[idx]
+  - normalize it by avg length:
+      nx_i = n_i.x / (faceLen_i_avg[idx] + 1e-14)
+      ny_i = n_i.y / (faceLen_i_avg[idx] + 1e-14)
+  - project velocity: un_i = u*nx_i + v*ny_i
+  - spectral radius:
+      lambda_i[idx] = (|un_i| + a) * faceLen_i_avg[idx]
+    This is the usual 1D Euler max signal speed times metric length.
+
+- j-direction: identical procedure.
+
+This gives you per-cell directional wave speeds aligned with the actual local face geometry.
+
+18. Overall call sequence in a solver
+Typical usage is:
+- create Mesh by size or by readPlot3D
+- if readPlot3D: ghost nodes are filled + cell centers computed
+- initialize flow field U with freestream everywhere
+- call mesh.buildGeometry(U, cfg);
+
+After that, every geometry-dependent module (flux routines, BCs needing normals, local timestep computation) has all the arrays it needs:
+- cellArea[..]
+- faceNormal_i[..], faceNormal_j[..]
+- faceNormal_i_out[..], faceNormal_j_out[..] (for “outward” logic)
+- faceLen_i[..], faceLen_j[..]
+- lambda_i[..], lambda_j[..]
