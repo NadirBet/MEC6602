@@ -1,0 +1,39 @@
+# mesh & BCs
+mesh = 1025x1025.x
+useSimpleFarfield = no
+freestreamEverywhere = false  #true
+
+# flow
+Mach = 0.5
+alpha = 0.0
+gamma = 1.4
+rho_inf = 1.0
+p_inf   = 1.0
+
+# numerics
+CFL = 6
+k2 = 0.5
+k4 = 0.016
+maxIter = 5000000
+printFreq = 10
+
+
+use_residual_smoothing = on
+smooth_eps_I = 0.5
+smooth_eps_J = 0.5
+
+
+useMultigrid = off
+mg_cycles    = 50000
+
+
+# logging
+debug.logLambdas = off
+debug.logJST     = off
+debug.logSplit   = off
+
+# JST self-test perturbation (pick one)
+perturb = none      # none | stripeI | stripeJ | gaussian
+perturbAmp = 1e-3
+perturbWaves = 1
+perturbSigma = 6
