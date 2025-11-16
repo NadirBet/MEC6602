@@ -1,0 +1,474 @@
+
+cmake --build build --parallel
+
+cmake --build build -j
+./build/mesh_check mesh.x
+
+cmake -S . -B build -G "MinGW Makefiles"
+
+./test_runner mesh.x
+./build/bin/euler_solver mesh.x
+
+./build/bin/tests_runner mesh.x
+
+./build/bin/cartesian_wall_test
+rm -rf build
+
+cmake -S . -B build -G Ninja
+
+cmake --build build --config Release
+
+
+
+cmake --build . --config Release
+./mesh_check ../../257x257.x
+
+
+./build/bin/euler_solver config.txt
+./euler_tests config.txt
+
+SOLVER SIMPLE DISSIPATION   CFL K2 K4 ALPHA
+./euler_solver 65x65.x 0.2 0 0.04 2.0
+./Wall_diagnostics
+CLASSIC CASE WITH JST ./euler_solver 9x9.x 0.4 0.5 0.02 2.0
+./euler_solver 65x65.x 0.5 0.5 0.02 2.0
+
+./mg_geometry_test ../../257x257.x 3
+
+./euler_solver 513x513.x 0.4 0.5 0.02 2.0
+RULE OF THUMB FOR YOUR ANALYSIS;
+IF YOU NEED MORE FILES OR FINORMATION, STOP WHAT YOUR DOING AND ASK FOR THEM, DO NOT INFER UNSURE INFORMATION
+DO NOT MODIFY THE FILES UNLESS NEEDED, 
+
+MAKE SURE OF THE LOGIC OF THE PROBLEM AND TRACK IT UNTIL THE DEEPEST LEVEL POSSIBLE 
+
+
+
+
+Rosalie Mdita mvdit recherche : 514288 1980 INFORMATIONS UR CES ETUDES ET LE MARCHE 
+MENDATE PAR LE MINISTERE DE LENSEIGNEMENT SUPERIEUR, 
+
+
+
+
+
+
+
+
+./test_level_0_1 9x9.x
+
+./test_level_0_1 33x33.x
+
+./test_level_0_1 257x257.x
+
+./test_level_0_1 all
+
+./test_level_2_flux_bc
+
+
+./test_level_3_residual
+
+./test_level_4
+
+
+./test_level_5
+./test_level_6
+
+./test_6_amovible
+
+./test_6_amovible 65x65.x roe rk4 50
+./test_6_amovible 65x65.x central rk4 5000
+./test_6_amovible 65x65.x roe hybrid 50
+./test_6_amovible 65x65.x roe implicit 50
+
+
+$ ./euler_solver_exe input.txt
+
+
+
+
+
+You’ve got two separate issues, and they line up exactly with what your new tests are screaming:
+
+Level-3 Test B (ghost copy) FAIL → your periodic i-ghosts aren’t being filled for all j rows.
+
+Level-4 Test C (row sum leak) FAIL → the residual assembly never adds the periodic seam face between i = imax-1 and i = imin, so mass leaks every row.
+
+Fixing these two things is the “right fix” for the behavior you’re seeing (non-zero ∑ᵢ Rρ · area at a row and the later blow-up).
+
+Below are surgical patches for exactly the two files that need changes.
+
+1) time_integrators.cpp — fill periodic i-ghosts for all j
+
+Your fillPeriodicIGaps helper only runs over interior j (jmin..jmax-1). Level-3 Test B checks the ghost columns across the full vertical extent, so those top/bottom ghost rows were never mirrored, hence the “Max |Δrho| periodic ghosts = 3.2”.
+
+Patch: change the j-loop to cover the entire column 0..mesh.njTotal-1.
+
+--- a/src/time_integrators.cpp
++++ b/src/time_integrators.cpp
+@@ -60,14 +60,14 @@ static void applyBoundaryConditions(const Config& cfg,
+     vgeom.build(U);
+
+     // Periodic gap in i-direction: copy interior columns into ghost columns
+-    auto fillPeriodicIGaps = [&](const Mesh& mesh, std::vector<Conservative>& U) {
++    auto fillPeriodicIGaps = [&](const Mesh& mesh, std::vector<Conservative>& U) {
+         int imin, imax, jmin, jmax;
+         mesh.getInteriorBounds(imin, imax, jmin, jmax);
+-        for (int j = jmin; j < jmax; ++j) {
++        for (int j = 0; j < mesh.njTotal; ++j) {
+             // left ghost column mirrors last interior column
+             U[ mesh.cellIndex(imin - 1, j) ] = U[ mesh.cellIndex(imax - 1, j) ];
+             // right ghost column mirrors first interior column
+             U[ mesh.cellIndex(imax,     j) ] = U[ mesh.cellIndex(imin,     j) ];
+         }
+     };
+
+
+That’s it for the Level-3 failure.
+
+2) ResidualBuilder.cpp — add the periodic seam face to the residual
+
+Your assemble() traverses interior faces but never adds the j-face that connects the last interior column to the first interior column. Test 4.C’s huge non-zero row sums are exactly the missing seam contributions.
+
+Patch: after your existing j-face interior loop, add one small loop to handle the seam by evaluating the left face of (i = imin, j) and accumulating it onto (i = imin, j) and its periodic neighbor (i = imax-1, j).
+
+--- a/src/ResidualBuilder.cpp
++++ b/src/ResidualBuilder.cpp
+@@ -... (inside ResidualBuilder::assemble)
+     // -----------------------------------------
+     // J-faces (vertex): left face of (i,j)
+     // -----------------------------------------
+     for (int i = imin + 1; i < imax; ++i) {
+         for (int j = jmin; j < jmax; ++j) {
+             const int idxRight = mesh.cellIndex(i,     j);
+             const int idxLeft  = mesh.cellIndex(i - 1, j);
+
+             // flux on the LEFT face of (i,j)
+             const Conservative F = fluxCalc.computeFlux(
+                 U, i, j, /*alongI=*/false, vgeom, mesh, cfg);
+
+             accum(R[idxRight], F, -1.0); // out of (i,j) to the left
+             accum(R[idxLeft ], F, +1.0); // into (i-1,j) from the right
+         }
+     }
+
++    // ------------------------------------------------------
++    // Periodic seam in i-direction: connect (imax-1, j) <-> (imin, j)
++    // Evaluate the LEFT face of the first interior cell (i=imin),
++    // whose ghost neighbor is the periodic mirror of (imax-1, j).
++    // ------------------------------------------------------
++    for (int j = jmin; j < jmax; ++j) {
++        const int iLeftMost = imin;
++        const int idxRight  = mesh.cellIndex(iLeftMost, j);      // (imin, j)
++        const int idxLeft   = mesh.cellIndex(imax - 1,  j);      // (imax-1, j)
++
++        const Conservative Fseam = fluxCalc.computeFlux(
++            U, iLeftMost, j, /*alongI=*/false, vgeom, mesh, cfg);
++
++        // Same sign convention as regular j-faces: flux leaves (imin,j) to the left
++        accum(R[idxRight], Fseam, -1.0);
++        accum(R[idxLeft ], Fseam, +1.0);
++    }
+
+
+No double-counting: your interior j-face loop starts at i = imin + 1, so the seam face (i = imin left face) is not included anywhere else.
+
+
+
+Here’s what would make it definitive:
+
+mesh.hpp / mesh.cpp (or whatever you have):
+
+I need to see:
+
+niTotal, njTotal
+
+getInteriorBounds(imin,imax,jmin,jmax)
+
+cellIndex(i,j)
+
+any periodic / ghost fill like fillGhostCellCoordinates()
+
+This tells us which columns are ghosts (likely imin-1 and imax) and which rows are ghosts, so we can check if residual loops should include/exclude them.
+
+VertexGeometry.hpp / .cpp:
+
+I need the definitions of face_i[...], face_j[...], and how they’re indexed (by cell).
+
+Your level-4 test compared vgeom.face_i[idxL] and vgeom.face_i[idxR], so I want to confirm those are indeed the vertical faces of that cell and not node-based or offset.
+
+BC files — the ones that actually apply ghost states:
+
+BoundaryConditions.hpp/.cpp or whatever holds Farfield::apply(...) and WallSlip::apply(...)
+
+I want to see their loops: do they loop over i=imin-1 or over i=0..niTotal-1? do they use mesh.getInteriorBounds(...) or hard-coded offsets?
+
+This is important because your residual now assumes:
+
+for i-faces: face between (i,j) and (i, j-1)
+
+for j-faces: face between (i,j) and (i-1, j)
+
+…which is clean, if the BCs filled exactly those neighbours.
+
+(Nice to have) Plot3DReader / mesh loading if your mesh decides where the airfoil / O-grid cut is — just to confirm periodic alignment. But the 3 above are the big ones.
+
+Why these? Because your current crash pattern (bad pressure near the top periodic row, then NaNs) is exactly what happens when:
+
+residual uses (i, j-1) or (i-1, j) assuming it’s a valid neighbour,
+
+but that neighbour is a ghost that wasn’t filled the same way on both periodic sides,
+
+and geometry for that face doesn’t match.
+
+So yes: send mesh, vertex geometry, and BC files, and I can tell you “your residual loop should be jmin+1..jmax-1” (or similar) with confidence instead of guessing.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# Tests (Level 0–1)
+# ============================================================
+add_executable(test_level_0_1
+    test_level_0_1.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_0_1 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_0_1 PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+# ============================================================
+# Tests (Level 2 – Fluxes & BCs)
+# ============================================================
+add_executable(test_level_2_flux_bc
+    test_level_2_flux_bc.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_2_flux_bc PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_2_flux_bc PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+
+#============================================================
+# Tests (Level 3 – Residual)
+# ============================================================
+add_executable(test_level_3_central
+    test_level_3_central.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_3_central PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_3_central PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+
+#============================================================
+# Tests (Level 3 – Residual)
+# ============================================================
+add_executable(test_level_3_roe
+    test_level_3_roe.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_3_roe PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_3_roe PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+#============================================================
+# Tests (Level 4)
+# ============================================================
+add_executable(test_level_4
+    test_level_4.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_4 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_4 PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+
+#============================================================
+# Tests (Level 5)
+# ============================================================
+add_executable(test_level_5
+    test_level_5.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_5 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_5 PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+#============================================================
+# Tests (Level 6)
+# ============================================================
+add_executable(test_level_6
+    test_level_6.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_level_6 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_level_6 PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+#============================================================
+# Tests (Level 6)
+# ============================================================
+add_executable(test_6_amovible
+    test_6_amovible.cpp
+    AirfoilForces.cpp
+    BoundaryConditions.cpp
+    mesh.cpp
+    Multigrid.cpp
+    numerical_fluxes.cpp
+    ProjectCore.cpp
+    ResidualBuilder.cpp
+    ResidualSmoothing.cpp
+    States.cpp
+    time_integrators.cpp
+)
+
+target_include_directories(test_6_amovible PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+)
+
+if (OpenMP_CXX_FOUND)
+    target_link_libraries(test_6_amovible PUBLIC OpenMP::OpenMP_CXX)
+endif()
+
+
+
+1. FILE-BY-FILE MAPPING {#file-mapping}
+OLD → NEW Mapping Table
+Old FileNew FileWhat HappenedWhymesh.hppMesh.hppSimplified, combined with geometrySingle source of truthmesh.cppMesh.hppInlined (was empty anyway)No separate implementation neededVertexGeometry.hppMesh.hpp (CellMetrics struct)Merged into Mesh classAvoid dual geometry systemVertexGeometry.cppMesh.hpp (computeMetrics)Simplified to one functionWas overcomplicatedStates.hppFlowState.hppCleaned upBetter organizationStates.cppFlowState.hppInlinedSimple enough to inlineConfig.hppNumerics.hpp (Config struct)Moved to numerics contextUsed by flux calculatornumerical_fluxes.hppNumerics.hppCombined with BCsRelated functionality togethernumerical_fluxes.cppNumerics.hppInlinedSimpler implementationBoundaryConditions.hppNumerics.hppMerged with fluxesBCs are part of numericsBoundaryConditions.cppNumerics.hppInlinedSingle clean implementationResidualBuilder.hppSolver.hpp (ResidualCalculator)Renamed & simplifiedClearer purposeResidualSmoothing.hppREMOVEDDeletedNot needed, caused issuesResidualSmoothing.cppREMOVEDDeletedOverly complextime_integrators.hppSolver.hpp (RungeKuttaSolver)Simplified to one schemeMultiple schemes caused confusiontime_integrators.cppSolver.hppCleaned, removed hacksHacks were masking BC bugsAirfoilForces.hppSolver.hpp (ForceCalculator)SimplifiedCleaner implementationAirfoilForces.cppSolver.hppSimplifiedSingle compute functionProjectCore.hppmain.cpp (Writer class)Moved to driverI/O belongs in mainPlot3DReader.hppMesh.hpp (readPlot3D method)Integrated into MeshMesh should read itselfMultigrid.hppREMOVEDDeleted for nowCan add back later if neededMultigrid.cppREMOVEDDeletedNot essential for basic solvermain.cppmain.cppCompletely rewrittenCleaner driverdiagnostics*.hppREMOVEDDeletedTesting code, not production
