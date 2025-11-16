@@ -640,7 +640,7 @@ static inline ResidualStats computeResidualStatsL2(
             const auto &r = R[id];
             const double v[4] = { r.rho, r.rhou, r.rhov, r.rhoE };
             for (int k=0;k<4;++k){
-                acc2[k]   += V * v[k]*v[k];
+                acc2[k]   +=v[k]*v[k];
                 maxAbs[k]  = std::max(maxAbs[k], std::abs(v[k]));
             }
         }
@@ -1037,6 +1037,16 @@ int main(int argc, char** argv)
     hist.open("history.csv");
     printIterHeader();
 
+    std::ofstream residual_file("residuals.txt");
+    if (residual_file.is_open()) {
+        residual_file << std::scientific << std::setprecision(12);
+        residual_file << "# Iteration    L2[rho]         L2[rhou]        L2[rhov]        L2[rhoE]        L2_total\n";
+        residual_file << "# " << std::string(100, '-') << "\n";
+    } else {
+        std::cerr << "[WARN] Could not open residuals.txt for writing\n";
+    }
+
+
     std::vector<double> dt_local;
 
     const double RES_TOL = 1e-12;
@@ -1115,6 +1125,19 @@ int main(int argc, char** argv)
             }
 
             hist.write(iter, cfg.CFL, dt_min, dt_avg, RS, AC);
+
+
+            if (residual_file.is_open()) {
+                residual_file << std::setw(8) << iter << "  "
+                            << std::setw(15) << RS.L2[0] << "  "
+                            << std::setw(15) << RS.L2[1] << "  "
+                            << std::setw(15) << RS.L2[2] << "  "
+                            << std::setw(15) << RS.L2[3] << "  "
+                            << std::setw(15) << RS.L2_total << "\n";
+                residual_file.flush();
+            }
+
+
         }
 
         // ================== SWITCH TO MULTIGRID HERE ==================
@@ -1208,9 +1231,13 @@ int main(int argc, char** argv)
     int finalIter = (convergedIter >= 0) ? convergedIter : (cfg.maxIter - 1);
 
     std::ostringstream vtkName;
-    vtkName << "solution_iter" << finalIter << ".vtk";
-
+    vtkName << "solution_M" << cfg.Mach_inf 
+            << "_alpha" << cfg.alpha_deg 
+            << "_mesh" << m.ni << "x" << m.nj 
+            << ".vtk";
     writeSolutionVTKPhysical(vtkName.str(), m, U, cfg);
+
+
 
     std::cout << "[TIME] Wall-clock time = " << elapsed.count() << " s\n";
     if (convergedIter >= 0) {
@@ -1225,3 +1252,4 @@ int main(int argc, char** argv)
     std::cout << "Done.\n";
     return 0;
 }
+
