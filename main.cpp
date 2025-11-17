@@ -1141,37 +1141,32 @@ int main(int argc, char** argv)
         }
 
         // ================== SWITCH TO MULTIGRID HERE ==================
+ 
         if (cfg.use_multigrid && iter == MG_START_ITER - 1) {
             std::cout << "[MG] Switching to multigrid after "
-                      << MG_START_ITER << " explicit iterations.\n";
+                    << MG_START_ITER << " explicit iterations.\n";
 
-            // Choose number of MG levels based on mesh; for now, hardcode 3.
             const int NUM_MG_LEVELS = 3;
 
-            FASMultigridSolver::LevelControl defaultCtrl; // details overridden inside
+            FASMultigridSolver::LevelControl defaultCtrl;
             FASMultigridSolver mg(
                 cfg,
                 opts.use_simple_farfield,
                 opts.freestream_everywhere,
-                meshFile,          // finest mesh filename
-                NUM_MG_LEVELS,     // number of levels (fine + coarsened)
+                meshFile,
+                NUM_MG_LEVELS,
                 defaultCtrl
             );
 
-            // Initialize MG hierarchy (reads same finest mesh, coarsens inside)
             mg.initialize();
-
-            // Inject current single-grid solution into finest level
             mg.finestSolution() = U;
-
-            // Rebuild ghosts/radii/residual/history on finest from this U
             mg.resetFinestFromCurrent();
 
-            const int    nCycles = cfg.mg_cycles;   // e.g. 1 V-cycle
-            const double resTol  = cfg.mg_res_tol;  // usually same as RES_TOL
+            const int    nCycles = cfg.mg_cycles;
+            const double resTol  = cfg.mg_res_tol;
 
             std::cout << "[MG] Running up to " << nCycles
-                      << " V-cycles (resTol = " << resTol << ").\n";
+                    << " V-cycles (resTol = " << resTol << ").\n";
 
             auto t_mg_start = std::chrono::high_resolution_clock::now();
             mg.runVCycles(nCycles, resTol);
@@ -1181,19 +1176,25 @@ int main(int argc, char** argv)
             auto& levels = mg.getLevels();
             FASMultigridSolver::Level& L0 = levels.front();
 
-            writeSolutionVTKPhysical("solution_mg.vtk", L0.mesh, L0.U, L0.cfg);
-
-            std::cout << "[MG] Finest-level L2 residual after multigrid = "
-                      << L0.currentResL2 << "\n";
-            std::cout << "[MG] Wall-clock time (multigrid only) = "
-                      << elapsed_mg.count() << " s\n";
-
             // Update U on single-grid side with MG finest solution
             U = L0.U;
 
+            // ========== WRITE VTK ONCE AT END (LIKE MAIN SOLVER) ==========
+            std::ostringstream mgVtkName;
+            mgVtkName << "solution_M" << cfg.Mach_inf 
+                    << "_alpha" << cfg.alpha_deg 
+                    << "_mesh" << m.ni << "x" << m.nj 
+                    << "_MG.vtk";
+            writeSolutionVTKPhysical(mgVtkName.str(), L0.mesh, L0.U, L0.cfg);
+            std::cout << "[MG] Wrote final solution: " << mgVtkName.str() << "\n";
+            // ==============================================================
+
+            std::cout << "[MG] Wall-clock time (multigrid only) = "
+                    << elapsed_mg.count() << " s\n";
+
             // ----------------- Extra fine-grid sweeps after MG -----------------
             std::cout << "[MG] Running " << POST_MG_FINE_SWEEPS
-                      << " extra fine-grid RK5 sweeps after multigrid.\n";
+                    << " extra fine-grid RK5 sweeps after multigrid.\n";
             for (int k = 0; k < POST_MG_FINE_SWEEPS; ++k) {
                 bc.apply(U, m);
                 std::vector<Primitive> W_tail(U.size());
@@ -1212,16 +1213,16 @@ int main(int argc, char** argv)
             if (RS_last.L2_total < RES_TOL) {
                 convergedIter = MG_START_ITER - 1 + POST_MG_FINE_SWEEPS;
                 std::cout << "[STOP] MG + fine-tail reached global tolerance "
-                          << RES_TOL << " (L2_total = " << RS_last.L2_total << ")\n";
+                        << RES_TOL << " (L2_total = " << RS_last.L2_total << ")\n";
             } else {
                 convergedIter = -1;
                 std::cout << "[WARN] MG + fine-tail did NOT reach global tolerance "
-                          << RES_TOL << " (L2_total = " << RS_last.L2_total << ")\n";
+                        << RES_TOL << " (L2_total = " << RS_last.L2_total << ")\n";
             }
 
-            // Exit explicit loop (we're done with iterations either way)
             break;
         }
+        
         // ==============================================================        
     }
 
