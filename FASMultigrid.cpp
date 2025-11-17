@@ -1,6 +1,6 @@
 // FASMultigrid.cpp - WITH DIAGNOSTIC CHECKS
 #include "FASMultigrid.hpp"
-
+#include <iomanip> 
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
@@ -105,19 +105,30 @@ FASMultigridSolver::FASMultigridSolver(
         // ----------------- CFL per level (keep as before) -----------------
         if (ell == 0) {
             // Finest grid
-            L.cfg.CFL = 1;
+            L.cfg.CFL = 2;
         } else if (ell == nLevels - 1) {
             // Coarsest grid: be more aggressive
-            L.cfg.CFL = 1;
+            L.cfg.CFL = 4;
         } else {
             // Intermediate grids
-            L.cfg.CFL = 1.5;
+            L.cfg.CFL = 3;
         }
 
         // ----------------- SWEEP CONTROL---------
 
-        L.ctrl.minSweeps       = 100;
-        L.ctrl.maxSweeps       = 100;
+    if (ell == 0) {
+        // Finest grid: moderate smoothing
+        L.ctrl.minSweeps = 7;
+        L.ctrl.maxSweeps = 10;
+    } else if (ell == nLevels - 1) {
+        // Coarsest grid: aggressive smoothing (no recursion, so smooth more)
+        L.ctrl.minSweeps = 8;
+        L.ctrl.maxSweeps = 8;
+    } else {
+        // Intermediate grids
+        L.ctrl.minSweeps = 8;
+        L.ctrl.maxSweeps = 8;
+    }
         L.ctrl.stallWindow     = 0;    // disable stall detection
         L.ctrl.stallTol        = 0.0;  // unused when stallWindow=0
         L.ctrl.targetReduction = 0.0;  // reduction <= 0.0 is never true
@@ -131,19 +142,19 @@ void FASMultigridSolver::initialize()
 {
     // 1) Read finest mesh once
     Mesh fine;
-    std::cout << "[MG] Reading finest mesh '" << finestMeshFile_ << "'\n";
+    //std::cout << "[MG] Reading finest mesh '" << finestMeshFile_ << "'\n";
     fine.readPlot3D(finestMeshFile_);
-    std::cout << "[MG] Finest mesh: ni x nj = "
-              << fine.ni << " x " << fine.nj << "\n";
+    /**std::cout << "[MG] Finest mesh: ni x nj = "
+              << fine.ni << " x " << fine.nj << "\n";*/
 
     // 2) Build hierarchy of meshes by 2x coarsening
     levels[0].mesh = fine;
 
     for (int ell = 1; ell < nLevels; ++ell) {
         levels[ell].mesh = coarsen2x(levels[ell-1].mesh);
-        std::cout << "[MG] Level " << ell
+    /**    std::cout << "[MG] Level " << ell
                   << " coarsened: ni x nj = "
-                  << levels[ell].mesh.ni << " x " << levels[ell].mesh.nj << "\n";
+                  << levels[ell].mesh.ni << " x " << levels[ell].mesh.nj << "\n";*/
     }
 
     // 3) Initialize state / residuals on each level
@@ -179,35 +190,117 @@ void FASMultigridSolver::initialize()
         L.resHistory.clear();
         L.resHistory.push_back(L.currentResL2);
 
-        std::cout << "[MG] Level " << ell
+    /**     std::cout << "[MG] Level " << ell
                   << " init L2 residual = " << std::scientific
-                  << L.currentResL2 << "\n";
+                  << L.currentResL2 << "\n";*/
     }
 
-    std::cout << "[MG] Initialized " << nLevels << " level(s).\n";
+    /**std::cout << "[MG] Initialized " << nLevels << " level(s).\n";*/
 }
 
 // ============================================================================
 // runVCycles
 // ============================================================================
 
+
 void FASMultigridSolver::runVCycles(int nCycles, double resTol)
 {
+    // Open residual file for finest level
+    std::ofstream residual_file("residuals_mg.txt");
+    if (residual_file.is_open()) {
+        residual_file << std::scientific << std::setprecision(12);
+        residual_file << "# V-Cycle    L2[rho]         L2[rhou]        L2[rhov]        L2[rhoE]        L2_total\n";
+        residual_file << "# " << std::string(100, '-') << "\n";
+    } else {
+        std::cerr << "[MG] WARNING: Could not open residuals_mg.txt for writing\n";
+    }
+
+    // Print header
+    std::cout << "[MG] Starting V-cycles (target residual: " << resTol << ")\n";
+    std::cout << "[MG] " << std::string(80, '-') << "\n";
+
+    Level& L0 = levels[0];  // Finest level
+    bool converged = false;
+    int final_cycle = 0;
+    
     for (int cyc = 0; cyc < nCycles; ++cyc) {
         std::cout << "[MG] === V-cycle " << cyc << " ===\n";
+        
+        // Perform V-cycle
         vCycle(0);
 
-        // recompute finest residual (no forcing on finest)
-        computeResidual(finestLevel());
-        double R = finestLevel().currentResL2;
-        std::cout << "[MG]   Finest L2 residual = " << R << "\n";
+        // Recompute finest residual (no forcing on finest)
+        computeResidual(L0);
+        double R_total = L0.currentResL2;
 
-        if (R < resTol) {
-            std::cout << "[MG]   Reached tolerance " << resTol
-                      << " at cycle " << cyc << "\n";
+        // Compute component residuals for file output
+        int imin, imax, jmin, jmax;
+        L0.mesh.getInteriorBounds(imin, imax, jmin, jmax);
+        
+        double acc2[4] = {0, 0, 0, 0};
+        double volSum = 0.0;
+        
+        for (int j = jmin; j < jmax; ++j) {
+            for (int i = imin; i < imax; ++i) {
+                int c = L0.mesh.cellIndex(i, j);
+                double V = L0.mesh.cellArea[c];
+                const Conservative& R = L0.R[c];
+                
+                acc2[0] += V * R.rho  * R.rho;
+                acc2[1] += V * R.rhou * R.rhou;
+                acc2[2] += V * R.rhov * R.rhov;
+                acc2[3] += V * R.rhoE * R.rhoE;
+                volSum += V;
+            }
+        }
+        
+        double L2[4];
+        for (int k = 0; k < 4; ++k) {
+            L2[k] = std::sqrt(acc2[k] / volSum);
+        }
+
+        // Print to console (finest level only)
+        std::cout << "[MG] V-cycle " << cyc 
+                  << ": L2_total = " << std::scientific << R_total << "\n";
+
+        // Write to residual file
+        if (residual_file.is_open()) {
+            residual_file << std::setw(8) << cyc << "  "
+                          << std::setw(15) << L2[0] << "  "
+                          << std::setw(15) << L2[1] << "  "
+                          << std::setw(15) << L2[2] << "  "
+                          << std::setw(15) << L2[3] << "  "
+                          << std::setw(15) << R_total << "\n";
+            residual_file.flush();
+        }
+
+        // Check convergence
+        if (R_total < resTol) {
+            converged = true;
+            final_cycle = cyc;
+            std::cout << "[MG] CONVERGED: Reached tolerance " << resTol
+                      << " at V-cycle " << cyc << "\n";
+            std::cout << "[MG] " << std::string(80, '-') << "\n";
             break;
         }
+        
+        final_cycle = cyc;
     }
+
+    if (residual_file.is_open()) {
+        residual_file.close();
+    }
+
+    // Status message
+    if (converged) {
+        std::cout << "[MG] Converged at V-cycle " << final_cycle 
+                  << " with L2_total = " << L0.currentResL2 << "\n";
+    } else {
+        std::cout << "[MG] Reached max V-cycles (" << nCycles 
+                  << ") with L2_total = " << L0.currentResL2 << "\n";
+    }
+    
+    std::cout << "[MG] Final finest-level L2 residual = " << L0.currentResL2 << "\n";
 }
 
 // ============================================================================
@@ -282,8 +375,7 @@ void FASMultigridSolver::vCycle(int ell)
     // 6) Prolongate correction back to this level
     prolongateCorrection(ell + 1, ell);
 
-    // 7) Post-smoothing on this level
-    smoothWithControl(L);
+
 }
 
 // ============================================================================
@@ -316,7 +408,7 @@ void FASMultigridSolver::smoothWithControl(Level& L)
             L.resHistory.pop_front();
         }
 
-        // ---- PRINT FOR EVERY LEVEL ----
+        /** // ---- PRINT FOR EVERY LEVEL ----
         if (sweeps == 1) {
             std::cout << "[MG] level " << L.index
                       << " R0 = " << std::scientific << R0 << "\n";
@@ -324,7 +416,7 @@ void FASMultigridSolver::smoothWithControl(Level& L)
         std::cout << "[MG] level " << L.index
                   << " sweep " << sweeps
                   << "  L2 = " << std::scientific << L.currentResL2
-                  << " (rel=" << L.currentResL2 / R0 << ")\n";
+                  << " (rel=" << L.currentResL2 / R0 << ")\n";*/
         // -------------------------------
 
         const bool reachedMin = (sweeps >= L.ctrl.minSweeps);
@@ -347,10 +439,12 @@ void FASMultigridSolver::smoothWithControl(Level& L)
         }
     }
 
-    std::cout << "[MG] level " << L.index
-              << " done smoothing: sweeps=" << sweeps
-              << "  best L2=" << std::scientific << L.bestResL2
-              << "  final L2=" << L.currentResL2 << "\n";
+
+    if (L.index == 0) {
+        std::cout << "  [MG] Finest level smoothing: sweeps=" << sweeps
+                << ", best L2=" << std::scientific << L.bestResL2
+                << ", final L2=" << L.currentResL2 << "\n";
+    }
 }
 
 
@@ -411,7 +505,7 @@ void FASMultigridSolver::smootherSweep(Level& L)
             }
         }
         
-        std::cout << "[FORCING CHECK] Level " << L.index 
+        /**std::cout << "[FORCING CHECK] Level " << L.index 
                   << " forcing application: max|R_computed - (R_pure + Q_F)| = ["
                   << std::scientific 
                   << max_diff_rho << ", "
@@ -422,7 +516,7 @@ void FASMultigridSolver::smootherSweep(Level& L)
         if (max_diff_rho > 1e-12 || max_diff_rhou > 1e-12 || 
             max_diff_rhov > 1e-12 || max_diff_rhoE > 1e-12) {
             std::cout << "[FORCING CHECK] WARNING: Forcing not being applied correctly!\n";
-        }
+        }*/
     }
     // ============================================================================
     
@@ -672,10 +766,21 @@ void FASMultigridSolver::restrictSolution(int fineIdx, int coarseIdx)
             const Conservative& RF01 = F.R[cF01];
             const Conservative& RF11 = F.R[cF11];
 
-            R_restr[cC].rho  = RF00.rho  + RF10.rho  + RF01.rho  + RF11.rho;
-            R_restr[cC].rhou = RF00.rhou + RF10.rhou + RF01.rhou + RF11.rhou;
-            R_restr[cC].rhov = RF00.rhov + RF10.rhov + RF01.rhov + RF11.rhov;
-            R_restr[cC].rhoE = RF00.rhoE + RF10.rhoE + RF01.rhoE + RF11.rhoE;
+
+
+
+            if (Atot > 0.0) {
+                R_restr[cC].rho  = (RF00.rho  * A00 + RF10.rho  * A10 + 
+                                    RF01.rho  * A01 + RF11.rho  * A11) / Atot;
+                R_restr[cC].rhou = (RF00.rhou * A00 + RF10.rhou * A10 + 
+                                    RF01.rhou * A01 + RF11.rhou * A11) / Atot;
+                R_restr[cC].rhov = (RF00.rhov * A00 + RF10.rhov * A10 + 
+                                    RF01.rhov * A01 + RF11.rhov * A11) / Atot;
+                R_restr[cC].rhoE = (RF00.rhoE * A00 + RF10.rhoE * A10 + 
+                                    RF01.rhoE * A01 + RF11.rhoE * A11) / Atot;
+            } else {
+                R_restr[cC] = Conservative();
+            }
         }
     }
 
@@ -697,10 +802,10 @@ void FASMultigridSolver::restrictSolution(int fineIdx, int coarseIdx)
     for (int jC = jCmin; jC < jCmax; ++jC) {
         for (int iC = iCmin; iC < iCmax; ++iC) {
             int cC = C.mesh.cellIndex(iC, jC);
-            C.forcing[cC].rho  = R_restr[cC].rho  - R2h0[cC].rho;
-            C.forcing[cC].rhou = R_restr[cC].rhou - R2h0[cC].rhou;
-            C.forcing[cC].rhov = R_restr[cC].rhov - R2h0[cC].rhov;
-            C.forcing[cC].rhoE = R_restr[cC].rhoE - R2h0[cC].rhoE;
+            C.forcing[cC].rho  = R2h0[cC].rho  - R_restr[cC].rho;
+            C.forcing[cC].rhou = R2h0[cC].rhou - R_restr[cC].rhou;
+            C.forcing[cC].rhov = R2h0[cC].rhov - R_restr[cC].rhov;
+            C.forcing[cC].rhoE = R2h0[cC].rhoE - R_restr[cC].rhoE;
         }
     }
 
@@ -736,20 +841,20 @@ void FASMultigridSolver::restrictSolution(int fineIdx, int coarseIdx)
         }
     }
     
-    std::cout << "[FAS CHECK] Level " << coarseIdx 
+    /**std::cout << "[FAS CHECK] Level " << coarseIdx 
               << " FAS consistency: max|R2h0 + Q_F - R_restr| = ["
               << std::scientific 
               << max_error_rho << ", "
               << max_error_rhou << ", "
               << max_error_rhov << ", "
-              << max_error_rhoE << "]\n";
+              << max_error_rhoE << "]\n";*/
     
     // These errors should be at machine precision (around 1e-15 or smaller)
     // If they're large, there's a sign error or algebraic mistake
     const double tol = 1e-12;
     if (max_error_rho > tol || max_error_rhou > tol || 
         max_error_rhov > tol || max_error_rhoE > tol) {
-        std::cout << "[FAS CHECK] WARNING: FAS consistency violated! Check sign conventions.\n";
+        //std::cout << "[FAS CHECK] WARNING: FAS consistency violated! Check sign conventions.\n";
     }
     // ============================================================================
 
@@ -1024,11 +1129,11 @@ void FASMultigridSolver::prolongateCorrection(int coarseIdx, int fineIdx)
         L2_after = std::sqrt(acc2 / volSum);
     }
     
-    double correction_ratio = L2_after / L2_before;
+    /**double correction_ratio = L2_after / L2_before;
     std::cout << "[CORRECTION CHECK] Level " << fineIdx 
               << ": L2_before = " << std::scientific << L2_before
               << ", L2_after = " << L2_after
-              << ", ratio = " << correction_ratio;
+              << ", ratio = " << correction_ratio;*/
     
 
 
